@@ -26,6 +26,31 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
+# Ensure pip is available
+if ! "$PYTHON" -m pip --version &>/dev/null; then
+    echo -e "\033[33m⚡ pip not found — installing pip…\033[0m"
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip 2>/dev/null
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y python3-pip 2>/dev/null
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y python3-pip 2>/dev/null
+    elif command -v apk &>/dev/null; then
+        sudo apk add --quiet py3-pip 2>/dev/null
+    fi
+    if ! "$PYTHON" -m pip --version &>/dev/null; then
+        echo -e "\033[33m⚡ Trying ensurepip…\033[0m"
+        "$PYTHON" -m ensurepip --upgrade 2>/dev/null || \
+            curl -sS https://bootstrap.pypa.io/get-pip.py | "$PYTHON" -
+    fi
+    if ! "$PYTHON" -m pip --version &>/dev/null; then
+        echo -e "\033[31m✗ Could not install pip. Install it manually:\033[0m"
+        echo "    apt install python3-pip   (or)   curl https://bootstrap.pypa.io/get-pip.py | python3 -"
+        exit 1
+    fi
+    echo -e "\033[32m✓ pip installed.\033[0m"
+fi
+
 # Install textual if missing
 if ! "$PYTHON" -c "import textual" 2>/dev/null; then
     echo -e "\033[33m⚡ Installing dependencies (first run only)…\033[0m"
@@ -45,8 +70,10 @@ cat > "$_TMPPY" << 'PYTHON_SCRIPT'
 import binascii
 import hashlib
 import os
+import random
 import re
 import socket
+import string
 import struct
 import subprocess
 import sys
@@ -249,6 +276,52 @@ class MikroTikAPI:
         except Exception:
             return []
 
+    def get_profiles(self) -> List[Dict[str, str]]:
+        try:
+            return self.command("/ppp/profile/print")
+        except Exception:
+            return []
+
+    def add_secret(self, name: str, password: str, service: str,
+                   profile: str) -> str:
+        """Create a PPP secret. Returns the .id of the new entry."""
+        self._send_sentence([
+            "/ppp/secret/add",
+            f"=name={name}",
+            f"=password={password}",
+            f"=service={service}",
+            f"=profile={profile}",
+        ])
+        while True:
+            s = self._read_sentence()
+            if s is None:
+                raise RuntimeError("No response")
+            if s[0] == "!done":
+                ret = next((w[5:] for w in s if w.startswith("=ret=")), "")
+                return ret
+            if s[0] in ("!trap", "!fatal"):
+                msg = next(
+                    (w.split("=message=", 1)[1] for w in s if "=message=" in w),
+                    str(s),
+                )
+                raise RuntimeError(msg)
+
+    def set_secret(self, sid: str, **attrs: str):
+        """Modify an existing PPP secret by .id."""
+        words = ["/ppp/secret/set", f"=.id={sid}"]
+        for k, v in attrs.items():
+            words.append(f"={k}={v}")
+        self.command(*words)
+
+    def disable_secret(self, sid: str):
+        self.command("/ppp/secret/set", f"=.id={sid}", "=disabled=yes")
+
+    def enable_secret(self, sid: str):
+        self.command("/ppp/secret/set", f"=.id={sid}", "=disabled=no")
+
+    def remove_secret(self, sid: str):
+        self.command("/ppp/secret/remove", f"=.id={sid}")
+
 
 # ── Traceroute ──────────────────────────────────────────────────────────────
 
@@ -449,6 +522,28 @@ class MikroTikMonitor(App):
         padding: 1 2;
         height: 1fr;
     }
+
+    #apitest-view {
+        display: none;
+        height: 1fr;
+        padding: 1;
+    }
+
+    #apitest-panel {
+        border: tall $success;
+        border-title-color: $success;
+        border-title-style: bold;
+        padding: 1 2;
+        height: 1fr;
+    }
+    #apitest-panel.running {
+        border: tall $warning;
+        border-title-color: $warning;
+    }
+    #apitest-panel.failed {
+        border: tall $error;
+        border-title-color: $error;
+    }
     """
 
     BINDINGS = [
@@ -460,6 +555,7 @@ class MikroTikMonitor(App):
         Binding("3", "focus_panel('trace')", "Trace", show=True),
         Binding("4", "focus_panel('secrets')", "Secrets", show=True),
         Binding("5", "focus_panel('active')", "Active", show=True),
+        Binding("6", "run_api_test", "API Test", show=True),
     ]
 
     def __init__(self, host: str, port: int, user: str, password: str):
@@ -479,6 +575,8 @@ class MikroTikMonitor(App):
         self._traceroute: List[Dict] = []
         self._port_scan: Dict[int, bool] = {}
         self._errors: List[str] = []
+        self._apitest_running = False
+        self._apitest_steps: List[Dict] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -492,6 +590,8 @@ class MikroTikMonitor(App):
                 yield DataTable(id="active-table")
         with Vertical(id="debug-view"):
             yield Panel("", id="debug-panel")
+        with Vertical(id="apitest-view"):
+            yield Panel("", id="apitest-panel")
         yield Footer()
 
     def on_mount(self):
@@ -503,6 +603,7 @@ class MikroTikMonitor(App):
         self.query_one("#secrets-table").border_title = "PPP Secrets"
         self.query_one("#active-table").border_title = "Active Connections"
         self.query_one("#debug-panel").border_title = "Diagnostics"
+        self.query_one("#apitest-panel").border_title = "API Test \u2014 PPP Secret CRUD"
 
         svc = self.query_one("#svc-table", DataTable)
         svc.add_columns("Service", "Port", "Status")
@@ -763,6 +864,13 @@ class MikroTikMonitor(App):
         self.query_one("#debug-panel", Panel).update("\n".join(L))
 
     def action_refresh(self):
+        atv = self.query_one("#apitest-view")
+        if atv.display and not self._apitest_running:
+            atv.display = False
+            self.query_one("#dashboard").display = True
+            self.notify("Back to dashboard")
+            self._do_refresh()
+            return
         if self._connected:
             self.notify("Refreshing\u2026")
             self._do_refresh()
@@ -784,6 +892,207 @@ class MikroTikMonitor(App):
             db.display = False
             dv.display = True
             self._render_debug_content()
+
+    def action_run_api_test(self):
+        if not self._connected:
+            self.notify("Not connected \u2014 connect first", severity="error")
+            return
+        if self._apitest_running:
+            self.notify("Test already running\u2026", severity="warning")
+            return
+        self.query_one("#dashboard").display = False
+        self.query_one("#debug-view").display = False
+        self.query_one("#apitest-view").display = True
+        p = self.query_one("#apitest-panel", Panel)
+        p.add_class("running")
+        p.remove_class("failed")
+        self._apitest_steps = []
+        self._render_apitest()
+        self._do_api_test()
+
+    def _add_test_step(self, label: str, status: str, detail: str = ""):
+        self._apitest_steps.append({
+            "label": label, "status": status, "detail": detail,
+            "ts": time.strftime("%H:%M:%S"),
+        })
+
+    def _render_apitest(self):
+        S = "\u2501"
+        ICONS = {
+            "pending": "[dim]\u25cb[/]",
+            "running": "[yellow]\u25d4[/]",
+            "ok":      "[green]\u2714[/]",
+            "fail":    "[red]\u2718[/]",
+        }
+        lines = [
+            f"[bold cyan]{S * 3} PPP Secret CRUD Test {S * 30}[/]\n",
+        ]
+        for step in self._apitest_steps:
+            icon = ICONS.get(step["status"], "?")
+            ts = f"[dim]{step['ts']}[/]  "
+            line = f"  {ts}{icon}  {step['label']}"
+            if step["detail"]:
+                line += f"  [dim]\u2014 {step['detail']}[/]"
+            lines.append(line)
+
+        if self._apitest_running:
+            lines.append(f"\n  [dim yellow]Test in progress\u2026[/]")
+        elif self._apitest_steps:
+            all_ok = all(s["status"] == "ok" for s in self._apitest_steps)
+            if all_ok:
+                lines.append(f"\n  [bold green]\u2714 All steps passed![/]")
+            else:
+                lines.append(f"\n  [bold red]\u2718 Test finished with errors[/]")
+            lines.append(
+                f"\n  [dim]Press [bold]6[/bold] to run again  |  "
+                f"[bold]r[/bold] to go back  |  [bold]q[/bold] to quit[/]"
+            )
+
+        self.query_one("#apitest-panel", Panel).update("\n".join(lines))
+
+    @work(thread=True, exclusive=True, group="apitest")
+    def _do_api_test(self):
+        self._apitest_running = True
+        api = self.api
+        rand_id = random.randint(1000, 9999)
+        username = f"yetfix{rand_id}"
+        password = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+        new_password = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+        sid = None
+
+        SKIP_PROFILES = {"default", "default-encryption"}
+        try:
+            profile_rows = api.get_profiles()
+        except Exception:
+            profile_rows = []
+        profile_names = [r.get("name", "") for r in profile_rows if r.get("name")]
+        user_profiles = [p for p in profile_names if p not in SKIP_PROFILES]
+        profile = user_profiles[0] if user_profiles else (
+            profile_names[0] if profile_names else "default"
+        )
+
+        steps = [
+            ("Fetch available profiles", "fetch_profiles"),
+            ("Create PPP secret", "create"),
+            ("Verify secret exists", "verify_create"),
+            ("Change password", "change_pw"),
+            ("Verify password changed", "verify_pw"),
+            ("Disable secret", "disable"),
+            ("Verify disabled", "verify_disable"),
+            ("Re-enable secret", "enable"),
+            ("Verify re-enabled", "verify_enable"),
+            ("Delete secret", "delete"),
+            ("Verify deleted", "verify_delete"),
+        ]
+
+        for label, _ in steps:
+            self._add_test_step(label, "pending")
+        self.call_from_thread(self._render_apitest)
+
+        def run_step(idx, action_fn):
+            self._apitest_steps[idx]["status"] = "running"
+            self._apitest_steps[idx]["ts"] = time.strftime("%H:%M:%S")
+            self.call_from_thread(self._render_apitest)
+            time.sleep(0.6)
+            try:
+                detail = action_fn()
+                self._apitest_steps[idx]["status"] = "ok"
+                self._apitest_steps[idx]["detail"] = detail or ""
+            except Exception as e:
+                self._apitest_steps[idx]["status"] = "fail"
+                self._apitest_steps[idx]["detail"] = str(e)
+                self.call_from_thread(self._render_apitest)
+                raise
+            self._apitest_steps[idx]["ts"] = time.strftime("%H:%M:%S")
+            self.call_from_thread(self._render_apitest)
+
+        try:
+            def do_fetch_profiles():
+                all_names = ", ".join(profile_names[:8])
+                return f"found {len(profile_names)} [{all_names}] \u2192 using \"{profile}\""
+            run_step(0, do_fetch_profiles)
+
+            def do_create():
+                nonlocal sid
+                sid = api.add_secret(username, password, "pppoe", profile)
+                return f"{username} / {password}  (profile={profile}, id={sid})"
+            run_step(1, do_create)
+
+            def do_verify_create():
+                secrets = api.get_secrets()
+                found = any(s.get("name") == username for s in secrets)
+                if not found:
+                    raise RuntimeError(f"{username} not found in secrets list")
+                return f"{username} found in {len(secrets)} secrets"
+            run_step(2, do_verify_create)
+
+            def do_change_pw():
+                api.set_secret(sid, password=new_password)
+                return f"password changed to {new_password}"
+            run_step(3, do_change_pw)
+
+            def do_verify_pw():
+                secrets = api.get_secrets()
+                entry = next((s for s in secrets if s.get("name") == username), None)
+                if not entry:
+                    raise RuntimeError("secret not found after password change")
+                return f"{username} still present"
+            run_step(4, do_verify_pw)
+
+            def do_disable():
+                api.disable_secret(sid)
+                return f"{username} disabled"
+            run_step(5, do_disable)
+
+            def do_verify_disable():
+                secrets = api.get_secrets()
+                entry = next((s for s in secrets if s.get("name") == username), None)
+                if not entry:
+                    raise RuntimeError("secret not found")
+                if entry.get("disabled") != "true":
+                    raise RuntimeError("disabled flag is not true")
+                return "disabled=true confirmed"
+            run_step(6, do_verify_disable)
+
+            def do_enable():
+                api.enable_secret(sid)
+                return f"{username} re-enabled"
+            run_step(7, do_enable)
+
+            def do_verify_enable():
+                secrets = api.get_secrets()
+                entry = next((s for s in secrets if s.get("name") == username), None)
+                if not entry:
+                    raise RuntimeError("secret not found")
+                if entry.get("disabled") == "true":
+                    raise RuntimeError("still disabled")
+                return "disabled=false confirmed"
+            run_step(8, do_verify_enable)
+
+            def do_delete():
+                api.remove_secret(sid)
+                return f"{username} removed"
+            run_step(9, do_delete)
+
+            def do_verify_delete():
+                secrets = api.get_secrets()
+                found = any(s.get("name") == username for s in secrets)
+                if found:
+                    raise RuntimeError(f"{username} still exists!")
+                return f"confirmed gone ({len(secrets)} secrets remain)"
+            run_step(10, do_verify_delete)
+
+        except Exception:
+            pass
+        finally:
+            self._apitest_running = False
+            p = self.query_one("#apitest-panel", Panel)
+            p.remove_class("running")
+            all_ok = all(s["status"] == "ok" for s in self._apitest_steps)
+            if not all_ok:
+                p.add_class("failed")
+            self.call_from_thread(self._render_apitest)
+            self.call_from_thread(self._do_refresh)
 
     def action_focus_panel(self, panel: str):
         targets = {
@@ -819,4 +1128,8 @@ if __name__ == "__main__":
     main()
 PYTHON_SCRIPT
 
-"$PYTHON" "$_TMPPY" "$@"
+if [ -t 0 ]; then
+    "$PYTHON" "$_TMPPY" "$@"
+else
+    "$PYTHON" "$_TMPPY" "$@" < /dev/tty
+fi
