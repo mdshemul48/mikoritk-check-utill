@@ -58,6 +58,29 @@ if ! "$PYTHON" -c "import textual" 2>/dev/null; then
     echo -e "\033[32m✓ Done.\033[0m"
 fi
 
+# Ensure traceroute is available for the traceroute panel
+if ! command -v traceroute &>/dev/null; then
+    echo -e "\033[33m⚡ traceroute not found — installing…\033[0m"
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq traceroute 2>/dev/null
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y traceroute 2>/dev/null
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y traceroute 2>/dev/null
+    elif command -v apk &>/dev/null; then
+        sudo apk add --quiet traceroute 2>/dev/null
+    elif command -v brew &>/dev/null; then
+        brew install traceroute 2>/dev/null
+    fi
+
+    if ! command -v traceroute &>/dev/null; then
+        echo -e "\033[31m✗ Could not install traceroute automatically.\033[0m"
+        echo "  The traceroute panel will show 'traceroute not found' until installed."
+    else
+        echo -e "\033[32m✓ traceroute installed.\033[0m"
+    fi
+fi
+
 # Write Python code to a temp file so stdin stays connected to the terminal
 _TMPPY=$(mktemp /tmp/mikrotik_monitor_XXXXXXXX)
 mv "$_TMPPY" "${_TMPPY}.py"
@@ -422,6 +445,35 @@ def run_traceroute(host: str) -> List[Dict]:
     return hops
 
 
+def run_ping_once(host: str, timeout_s: float = 2.0) -> Dict[str, object]:
+    """Run a single ICMP ping and return parsed latency."""
+    commands = [
+        ["ping", "-c", "1", "-W", str(int(timeout_s)), host],  # Linux
+        ["ping", "-c", "1", "-t", str(int(timeout_s)), host],  # macOS/BSD fallback
+    ]
+    last_out = ""
+    for cmd in commands:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(3, int(timeout_s) + 2),
+            )
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            last_out = out
+            m = re.search(r"time[=<]\s*([\d.]+)\s*ms", out)
+            if m:
+                return {"ok": True, "latency_ms": float(m.group(1))}
+        except FileNotFoundError:
+            return {"ok": False, "error": "ping not found"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "ping timeout"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": "no reply", "raw": last_out}
+
+
 # ── Port Scanner ────────────────────────────────────────────────────────────
 
 _PORT_NAMES = {
@@ -649,6 +701,8 @@ class MikroTikMonitor(App):
         self._secrets: List[Dict[str, str]] = []
         self._active: List[Dict[str, str]] = []
         self._traceroute: List[Dict] = []
+        self._ping_history: List[Optional[float]] = []
+        self._ping_last_error = ""
         self._port_scan: Dict[int, bool] = {}
         self._errors: List[str] = []
         self._apitest_running = False
@@ -698,7 +752,9 @@ class MikroTikMonitor(App):
 
         self._do_connect()
         self._do_traceroute()
+        self._do_ping()
         self.set_interval(15, self._auto_refresh)
+        self.set_interval(2, self._tick_ping)
 
     @work(thread=True, exclusive=True, group="api")
     def _do_connect(self):
@@ -731,6 +787,19 @@ class MikroTikMonitor(App):
         else:
             self.call_from_thread(self._render_debug_content)
 
+    @work(thread=True, exclusive=True, group="ping")
+    def _do_ping(self):
+        result = run_ping_once(self.api_host, timeout_s=2.0)
+        if result.get("ok"):
+            self._ping_history.append(float(result["latency_ms"]))
+            self._ping_last_error = ""
+        else:
+            self._ping_history.append(None)
+            self._ping_last_error = str(result.get("error", "no reply"))
+        if len(self._ping_history) > 40:
+            self._ping_history = self._ping_history[-40:]
+        self.call_from_thread(self._render_traceroute)
+
     @work(thread=True, exclusive=True, group="scan")
     def _do_port_scan(self):
         ports = sorted({self.api_port, 8728, 8729, 80, 443, 22, 23, 21, 7272})
@@ -755,6 +824,9 @@ class MikroTikMonitor(App):
     def _auto_refresh(self):
         if self._connected:
             self._do_refresh()
+
+    def _tick_ping(self):
+        self._do_ping()
 
     def _render_dashboard(self):
         self._hide_all_views()
@@ -825,28 +897,58 @@ class MikroTikMonitor(App):
         tbl.border_subtitle = f"{len(self._services)} services"
 
     def _render_traceroute(self):
-        if not self._traceroute:
-            return
-        max_t = max(
-            (max(h["times"], default=0) for h in self._traceroute), default=1
-        ) or 1
         lines = []
-        for h in self._traceroute:
-            n, host, times = h["hop"], h["host"], h["times"]
-            if times:
-                avg = sum(times) / len(times)
-                w = 25
-                filled = min(int(w * avg / max_t), w)
-                c = _latency_color(avg)
-                blk = "\u2588" * filled + "\u2591" * (w - filled)
-                bar = f"[{c}]{blk}[/]"
-                lines.append(
-                    f"  [bold]{n:>2}[/]  {host:<20} {bar}  {avg:.1f} ms"
-                )
-            else:
-                lines.append(f"  [bold]{n:>2}[/]  {host:<20} [dim]* * *[/]")
+        hist = self._ping_history[-40:]
+        ok_samples = [v for v in hist if v is not None]
+        if hist:
+            loss = (len(hist) - len(ok_samples)) / len(hist) * 100.0
+        else:
+            loss = 0.0
+
+        if ok_samples:
+            last = ok_samples[-1]
+            avg = sum(ok_samples) / len(ok_samples)
+            mn = min(ok_samples)
+            mx = max(ok_samples)
+            lc = _latency_color(last)
+            squares = "".join(
+                "[green]■[/]" if v is not None else "[red]■[/]" for v in hist
+            )
+            lines.append(
+                f"  [bold]Ping[/]  [{lc}]● {last:.1f} ms[/]  "
+                f"[dim](avg {avg:.1f} / min {mn:.1f} / max {mx:.1f}, loss {loss:.0f}%)[/]"
+            )
+            lines.append(f"        {squares}")
+        else:
+            msg = self._ping_last_error or "waiting..."
+            lines.append(f"  [bold]Ping[/]  [yellow]no reply[/]  [dim]({msg})[/]")
+
+        lines.append("")
+        lines.append("  [bold]Traceroute[/]")
+        if self._traceroute:
+            max_t = max(
+                (max(h["times"], default=0) for h in self._traceroute), default=1
+            ) or 1
+            for h in self._traceroute:
+                n, host, times = h["hop"], h["host"], h["times"]
+                if times:
+                    avg = sum(times) / len(times)
+                    w = 25
+                    filled = min(int(w * avg / max_t), w)
+                    c = _latency_color(avg)
+                    blk = "\u2588" * filled + "\u2591" * (w - filled)
+                    bar = f"[{c}]{blk}[/]"
+                    lines.append(
+                        f"  [bold]{n:>2}[/]  {host:<20} {bar}  {avg:.1f} ms"
+                    )
+                else:
+                    lines.append(f"  [bold]{n:>2}[/]  {host:<20} [dim]* * *[/]")
+        else:
+            lines.append("  [dim]Waiting for traceroute...[/]")
         self.query_one("#trace-panel", Panel).update("\n".join(lines))
-        self.query_one("#trace-panel").border_subtitle = f"{len(self._traceroute)} hops"
+        self.query_one("#trace-panel").border_subtitle = (
+            f"{len(self._traceroute)} hops | ping 2s"
+        )
 
     def _render_secrets(self):
         tbl = self.query_one("#secrets-table", DataTable)
