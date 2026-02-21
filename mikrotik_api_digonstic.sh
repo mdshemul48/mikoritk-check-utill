@@ -85,7 +85,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Header, Static
 
 
@@ -103,6 +103,7 @@ class MikroTikAPI:
         self.connected = False
         self.logged_in = False
         self.latency_ms: float = 0
+        self.raw_log: List[Dict] = []
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -111,6 +112,15 @@ class MikroTikAPI:
         self.sock.connect((self.host, self.port))
         self.latency_ms = (time.monotonic() - t0) * 1000
         self.connected = True
+        self.raw_log.append({
+            "ts": time.strftime("%H:%M:%S"),
+            "cmd": "TCP connect",
+            "elapsed_ms": round(self.latency_ms, 1),
+            "rows": 0,
+            "error": None,
+            "sentences": [],
+            "info": f"{self.host}:{self.port}",
+        })
 
     def disconnect(self):
         if self.sock:
@@ -189,13 +199,21 @@ class MikroTikAPI:
 
     def login(self, user: str, password: str) -> Tuple[bool, str]:
         """Authenticate — auto-detects old (challenge) vs new (plaintext) style."""
+        t0 = time.monotonic()
+        raw_sentences: List[List[str]] = []
+
         self._send_sentence(["/login", f"=name={user}", f"=password={password}"])
         resp = self._read_sentence()
+        if resp is not None:
+            raw_sentences.append(resp)
+
         if resp is None:
+            self._log_login(t0, raw_sentences, None, "No response (timeout)")
             return False, "No response (timeout)"
 
         if resp[0] == "!done" and not any(w.startswith("=ret=") for w in resp):
             self.logged_in = True
+            self._log_login(t0, raw_sentences, "RouterOS 6.43+", None)
             return True, "RouterOS 6.43+"
 
         challenge = next((w[5:] for w in resp if w.startswith("=ret=")), None)
@@ -207,28 +225,54 @@ class MikroTikAPI:
                 ["/login", f"=name={user}", f"=response=00{md5.hexdigest()}"]
             )
             r2 = self._read_sentence()
+            if r2 is not None:
+                raw_sentences.append(r2)
             if r2 and r2[0] == "!done":
                 self.logged_in = True
+                self._log_login(t0, raw_sentences, "challenge-response", None)
                 return True, "challenge-response"
-            return False, f"Challenge rejected: {r2}"
+            err = f"Challenge rejected: {r2}"
+            self._log_login(t0, raw_sentences, None, err)
+            return False, err
 
         if resp[0] in ("!trap", "!fatal"):
             msg = next(
                 (w.split("=message=", 1)[1] for w in resp if "=message=" in w),
                 str(resp),
             )
+            self._log_login(t0, raw_sentences, None, msg)
             return False, msg
 
-        return False, f"Unexpected: {resp}"
+        err = f"Unexpected: {resp}"
+        self._log_login(t0, raw_sentences, None, err)
+        return False, err
+
+    def _log_login(self, t0: float, sentences: List[List[str]],
+                   method: Optional[str], error: Optional[str]):
+        elapsed = (time.monotonic() - t0) * 1000
+        self.raw_log.append({
+            "ts": time.strftime("%H:%M:%S"),
+            "cmd": "/login",
+            "elapsed_ms": round(elapsed, 1),
+            "rows": 0,
+            "error": error,
+            "sentences": sentences,
+            "info": method,
+        })
 
     def command(self, *words: str) -> List[Dict[str, str]]:
         """Send API command; return list of attribute dicts (one per !re)."""
+        cmd_name = words[0] if words else "?"
+        t0 = time.monotonic()
+        raw_sentences: List[List[str]] = []
         self._send_sentence(list(words))
         rows: List[Dict[str, str]] = []
+        error_msg = None
         while True:
             sentence = self._read_sentence()
             if sentence is None:
                 break
+            raw_sentences.append(sentence)
             tag = sentence[0]
             attrs: Dict[str, str] = {}
             for w in sentence[1:]:
@@ -241,7 +285,25 @@ class MikroTikAPI:
             elif tag == "!done":
                 break
             elif tag in ("!trap", "!fatal"):
-                raise RuntimeError(attrs.get("message", str(sentence)))
+                error_msg = attrs.get("message", str(sentence))
+                while True:
+                    tail = self._read_sentence()
+                    if tail is None or tail[0] == "!done":
+                        if tail:
+                            raw_sentences.append(tail)
+                        break
+                break
+        elapsed = (time.monotonic() - t0) * 1000
+        self.raw_log.append({
+            "ts": time.strftime("%H:%M:%S"),
+            "cmd": cmd_name,
+            "elapsed_ms": round(elapsed, 1),
+            "rows": len(rows),
+            "error": error_msg,
+            "sentences": raw_sentences,
+        })
+        if error_msg:
+            raise RuntimeError(error_msg)
         return rows
 
     def get_identity(self) -> str:
@@ -544,6 +606,19 @@ class MikroTikMonitor(App):
         border: tall $error;
         border-title-color: $error;
     }
+
+    #rawdata-view {
+        display: none;
+        height: 1fr;
+        padding: 1;
+    }
+
+    #rawdata-panel {
+        border: tall $primary;
+        border-title-color: $primary;
+        border-title-style: bold;
+        padding: 1 2;
+    }
     """
 
     BINDINGS = [
@@ -556,6 +631,7 @@ class MikroTikMonitor(App):
         Binding("4", "focus_panel('secrets')", "Secrets", show=True),
         Binding("5", "focus_panel('active')", "Active", show=True),
         Binding("6", "run_api_test", "API Test", show=True),
+        Binding("7", "show_raw_data", "Raw Log", show=True),
     ]
 
     def __init__(self, host: str, port: int, user: str, password: str):
@@ -592,6 +668,8 @@ class MikroTikMonitor(App):
             yield Panel("", id="debug-panel")
         with Vertical(id="apitest-view"):
             yield Panel("", id="apitest-panel")
+        with VerticalScroll(id="rawdata-view"):
+            yield Panel("", id="rawdata-panel")
         yield Footer()
 
     def on_mount(self):
@@ -604,6 +682,7 @@ class MikroTikMonitor(App):
         self.query_one("#active-table").border_title = "Active Connections"
         self.query_one("#debug-panel").border_title = "Diagnostics"
         self.query_one("#apitest-panel").border_title = "API Test \u2014 PPP Secret CRUD"
+        self.query_one("#rawdata-panel").border_title = "Raw API Log"
 
         svc = self.query_one("#svc-table", DataTable)
         svc.add_columns("Service", "Port", "Status")
@@ -678,8 +757,8 @@ class MikroTikMonitor(App):
             self._do_refresh()
 
     def _render_dashboard(self):
+        self._hide_all_views()
         self.query_one("#dashboard").display = True
-        self.query_one("#debug-view").display = False
         self.sub_title = f"{self._identity}  |  {self.api_host}:{self.api_port}"
         self._render_conn_info()
         self._render_services()
@@ -799,7 +878,7 @@ class MikroTikMonitor(App):
         tbl.border_subtitle = f"{len(self._active)} online"
 
     def _show_debug(self):
-        self.query_one("#dashboard").display = False
+        self._hide_all_views()
         self.query_one("#debug-view").display = True
         self.query_one("#conn-panel").add_class("disconnected")
         self.sub_title = f"DISCONNECTED  |  {self.api_host}:{self.api_port}"
@@ -865,8 +944,14 @@ class MikroTikMonitor(App):
 
     def action_refresh(self):
         atv = self.query_one("#apitest-view")
+        rv = self.query_one("#rawdata-view")
+        if rv.display:
+            self._hide_all_views()
+            self.query_one("#dashboard").display = True
+            self.notify("Back to dashboard")
+            return
         if atv.display and not self._apitest_running:
-            atv.display = False
+            self._hide_all_views()
             self.query_one("#dashboard").display = True
             self.notify("Back to dashboard")
             self._do_refresh()
@@ -884,12 +969,11 @@ class MikroTikMonitor(App):
 
     def action_toggle_debug(self):
         dv = self.query_one("#debug-view")
-        db = self.query_one("#dashboard")
         if dv.display:
-            dv.display = False
-            db.display = True
+            self._hide_all_views()
+            self.query_one("#dashboard").display = True
         else:
-            db.display = False
+            self._hide_all_views()
             dv.display = True
             self._render_debug_content()
 
@@ -900,8 +984,7 @@ class MikroTikMonitor(App):
         if self._apitest_running:
             self.notify("Test already running\u2026", severity="warning")
             return
-        self.query_one("#dashboard").display = False
-        self.query_one("#debug-view").display = False
+        self._hide_all_views()
         self.query_one("#apitest-view").display = True
         p = self.query_one("#apitest-panel", Panel)
         p.add_class("running")
@@ -1094,6 +1177,112 @@ class MikroTikMonitor(App):
             self.call_from_thread(self._render_apitest)
             self.call_from_thread(self._do_refresh)
 
+    def _hide_all_views(self):
+        self.query_one("#dashboard").display = False
+        self.query_one("#debug-view").display = False
+        self.query_one("#apitest-view").display = False
+        self.query_one("#rawdata-view").display = False
+
+    def action_show_raw_data(self):
+        rv = self.query_one("#rawdata-view")
+        if rv.display:
+            rv.display = False
+            self.query_one("#dashboard").display = True
+            return
+        self._hide_all_views()
+        rv.display = True
+        self._render_raw_data()
+
+    def _render_raw_data(self):
+        S = "\u2501"
+        log = self.api.raw_log if self.api else []
+        if not log:
+            self.query_one("#rawdata-panel", Panel).update(
+                "[dim]No API commands recorded yet.[/]"
+            )
+            return
+
+        lines = [
+            f"[bold cyan]{S * 3} Raw API Log "
+            f"({len(log)} entries) {S * 33}[/]\n",
+        ]
+        MAX_CHARS = 1000
+        for i, entry in enumerate(log):
+            ts = entry["ts"]
+            cmd = entry["cmd"]
+            ms = entry["elapsed_ms"]
+            rows = entry["rows"]
+            err = entry["error"]
+            info = entry.get("info", "")
+
+            if err:
+                icon = "[red]\u2718[/]"
+                summary = f"[red]ERROR: {err}[/]"
+            elif info:
+                icon = "[green]\u2714[/]"
+                summary = f"[green]{info}[/]"
+            else:
+                icon = "[green]\u2714[/]"
+                summary = f"[green]{rows} row(s)[/]"
+
+            idx = f"[dim]#{i+1:<3}[/]"
+            lines.append(
+                f"  {idx} [dim]{ts}[/]  {icon}  [bold]{cmd}[/]"
+                f"  {summary}  [dim]{ms}ms[/]"
+            )
+
+            chars_used = 0
+            truncated = False
+            for sentence in entry["sentences"]:
+                if truncated:
+                    break
+                tag = sentence[0] if sentence else "?"
+                rest = sentence[1:] if len(sentence) > 1 else []
+                if tag == "!re":
+                    attrs = []
+                    for w in rest:
+                        if w.startswith("="):
+                            attrs.append(w[1:])
+                    for attr in attrs:
+                        chars_used += len(attr) + 20
+                        if chars_used > MAX_CHARS:
+                            lines.append(
+                                f"             [dim yellow]\u2026 truncated "
+                                f"(>{MAX_CHARS} chars)[/]"
+                            )
+                            truncated = True
+                            break
+                        lines.append(f"             [dim cyan]!re[/]  {attr}")
+                elif tag == "!done":
+                    extra = ""
+                    for w in rest:
+                        if w.startswith("=ret="):
+                            extra = f"  ret={w[5:]}"
+                    lines.append(f"             [dim green]!done{extra}[/]")
+                elif tag in ("!trap", "!fatal"):
+                    lines.append(
+                        f"             [red]{tag}[/]  {' '.join(rest)}"
+                    )
+                else:
+                    lines.append(
+                        f"             [dim]{' '.join(sentence)}[/]"
+                    )
+                    chars_used += sum(len(w) for w in sentence) + 20
+
+            if not entry["sentences"]:
+                if info:
+                    lines.append(f"             [dim]{info}[/]")
+
+            lines.append("")
+
+        lines.append(
+            f"  [dim]Press [bold]7[/bold] to close  |  "
+            f"[bold]r[/bold] to refresh data  |  "
+            f"[bold]q[/bold] to quit  |  "
+            f"scroll with [bold]\u2191\u2193[/bold] or mouse[/]"
+        )
+        self.query_one("#rawdata-panel", Panel).update("\n".join(lines))
+
     def action_focus_panel(self, panel: str):
         targets = {
             "conn": "#conn-panel",
@@ -1130,6 +1319,8 @@ PYTHON_SCRIPT
 
 if [ -t 0 ]; then
     "$PYTHON" "$_TMPPY" "$@"
-else
+elif ( exec < /dev/tty ) 2>/dev/null; then
     "$PYTHON" "$_TMPPY" "$@" < /dev/tty
+else
+    "$PYTHON" "$_TMPPY" "$@"
 fi
