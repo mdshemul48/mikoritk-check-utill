@@ -1,34 +1,55 @@
-#!/usr/bin/env python3
+#!/bin/bash
+# MikroTik API Diagnostic Center
+# Usage:
+#   Direct:  ./mikrotik_api_digonstic.sh <ip> <port> <user> <password>
+#   Remote:  curl -s https://scripts.yetfix.com/mikrotik-api-diagnostic-center.sh | bash -s -- <ip> <port> <user> <password>
+
+set -e
+
+if [ $# -ne 4 ]; then
+    echo "Usage: $0 <ip> <port> <username> <password>"
+    exit 1
+fi
+
+# Find Python 3
+PYTHON=""
+for cmd in python3 python; do
+    if command -v "$cmd" &>/dev/null && "$cmd" -c "import sys; assert sys.version_info >= (3,8)" 2>/dev/null; then
+        PYTHON="$cmd"
+        break
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    echo "Error: Python 3.8+ is required but not found."
+    echo "Install it with:  apt install python3  (or)  brew install python3"
+    exit 1
+fi
+
+# Install textual if missing
+if ! "$PYTHON" -c "import textual" 2>/dev/null; then
+    echo -e "\033[33m⚡ Installing dependencies (first run only)…\033[0m"
+    "$PYTHON" -m pip install textual -q 2>/dev/null || "$PYTHON" -m pip install --user textual -q
+    echo -e "\033[32m✓ Done.\033[0m"
+fi
+
+# Write Python code to a temp file so stdin stays connected to the terminal
+_TMPPY=$(mktemp /tmp/mikrotik_monitor_XXXXXXXX)
+mv "$_TMPPY" "${_TMPPY}.py"
+_TMPPY="${_TMPPY}.py"
+trap 'rm -f "$_TMPPY"' EXIT
+
+cat > "$_TMPPY" << 'PYTHON_SCRIPT'
 """MikroTik TUI Monitor — comprehensive router monitoring dashboard."""
 
-# ── Auto-install dependencies ───────────────────────────────────────────────
-import subprocess as _sp
-import sys as _sys
-import os as _os
-
-
-def _ensure_deps():
-    try:
-        import textual  # noqa: F401
-    except ImportError:
-        print("\033[33m⚡ Installing dependencies (first run only)…\033[0m")
-        _sp.check_call(
-            [_sys.executable, "-m", "pip", "install", "textual"],
-            stdout=_sp.PIPE,
-            stderr=_sp.PIPE,
-        )
-        print("\033[32m✓ Dependencies installed. Restarting…\033[0m")
-        _os.execv(_sys.executable, [_sys.executable] + _sys.argv)
-
-
-_ensure_deps()
-
-# ── Imports ─────────────────────────────────────────────────────────────────
 import binascii
 import hashlib
+import os
 import re
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -56,8 +77,6 @@ class MikroTikAPI:
         self.logged_in = False
         self.latency_ms: float = 0
 
-    # ── connection ──────────────────────────────────────────────────────────
-
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
@@ -74,8 +93,6 @@ class MikroTikAPI:
                 pass
         self.connected = False
         self.logged_in = False
-
-    # ── wire helpers ────────────────────────────────────────────────────────
 
     @staticmethod
     def _encode_length(length: int) -> bytes:
@@ -143,8 +160,6 @@ class MikroTikAPI:
                 return None
             words.append(data.decode("utf-8", errors="replace"))
 
-    # ── authentication ──────────────────────────────────────────────────────
-
     def login(self, user: str, password: str) -> Tuple[bool, str]:
         """Authenticate — auto-detects old (challenge) vs new (plaintext) style."""
         self._send_sentence(["/login", f"=name={user}", f"=password={password}"])
@@ -179,8 +194,6 @@ class MikroTikAPI:
 
         return False, f"Unexpected: {resp}"
 
-    # ── command execution ───────────────────────────────────────────────────
-
     def command(self, *words: str) -> List[Dict[str, str]]:
         """Send API command; return list of attribute dicts (one per !re)."""
         self._send_sentence(list(words))
@@ -203,8 +216,6 @@ class MikroTikAPI:
             elif tag in ("!trap", "!fatal"):
                 raise RuntimeError(attrs.get("message", str(sentence)))
         return rows
-
-    # ── high-level fetchers ─────────────────────────────────────────────────
 
     def get_identity(self) -> str:
         try:
@@ -246,7 +257,7 @@ def run_traceroute(host: str) -> List[Dict]:
     """Run system traceroute and return parsed hops."""
     hops: List[Dict] = []
     try:
-        proc = _sp.run(
+        proc = subprocess.run(
             ["traceroute", "-m", "15", "-w", "2", host],
             capture_output=True,
             text=True,
@@ -269,7 +280,7 @@ def run_traceroute(host: str) -> List[Dict]:
             )
     except FileNotFoundError:
         hops.append({"hop": 0, "host": "traceroute not found", "times": []})
-    except _sp.TimeoutExpired:
+    except subprocess.TimeoutExpired:
         hops.append({"hop": 0, "host": "timed out", "times": []})
     except Exception as e:
         hops.append({"hop": 0, "host": str(e), "times": []})
@@ -327,14 +338,6 @@ def _latency_color(ms: float) -> str:
     return "yellow" if ms < 100 else "red"
 
 
-def _bar(value: float, maximum: float, width: int = 20) -> Tuple[str, str]:
-    """Return (bar_string, color)."""
-    ratio = min(value / maximum, 1.0) if maximum else 0
-    filled = int(width * ratio)
-    color = _load_color(ratio * 100)
-    return "█" * filled + "░" * (width - filled), color
-
-
 # ── Focusable Static widget ────────────────────────────────────────────────
 
 
@@ -356,8 +359,6 @@ class MikroTikMonitor(App):
     Screen {
         background: $surface;
     }
-
-    /* ── dashboard layout ─────────────────────────────────── */
 
     #dashboard {
         height: 1fr;
@@ -435,8 +436,6 @@ class MikroTikMonitor(App):
         border: double $accent;
     }
 
-    /* ── debug view ───────────────────────────────────────── */
-
     #debug-view {
         display: none;
         height: 1fr;
@@ -481,8 +480,6 @@ class MikroTikMonitor(App):
         self._port_scan: Dict[int, bool] = {}
         self._errors: List[str] = []
 
-    # ── compose ─────────────────────────────────────────────────────────────
-
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="dashboard"):
@@ -496,8 +493,6 @@ class MikroTikMonitor(App):
         with Vertical(id="debug-view"):
             yield Panel("", id="debug-panel")
         yield Footer()
-
-    # ── mount ───────────────────────────────────────────────────────────────
 
     def on_mount(self):
         self.sub_title = f"{self.api_host}:{self.api_port}"
@@ -525,11 +520,8 @@ class MikroTikMonitor(App):
         self._do_traceroute()
         self.set_interval(15, self._auto_refresh)
 
-    # ── workers (background threads) ────────────────────────────────────────
-
     @work(thread=True, exclusive=True, group="api")
     def _do_connect(self):
-        """Connect, login, fetch everything."""
         try:
             api = MikroTikAPI(self.api_host, self.api_port, timeout=10)
             api.connect()
@@ -567,7 +559,6 @@ class MikroTikMonitor(App):
 
     @work(thread=True, exclusive=True, group="api")
     def _do_refresh(self):
-        """Re-fetch data on existing connection."""
         if not self.api or not self.api.logged_in:
             return
         try:
@@ -584,8 +575,6 @@ class MikroTikMonitor(App):
     def _auto_refresh(self):
         if self._connected:
             self._do_refresh()
-
-    # ── dashboard rendering ─────────────────────────────────────────────────
 
     def _render_dashboard(self):
         self.query_one("#dashboard").display = True
@@ -614,8 +603,8 @@ class MikroTikMonitor(App):
         W = 20
         cpu_filled = min(int(W * cpu_pct / 100), W)
         mem_filled = min(int(W * mem_pct / 100), W)
-        cpu_bar = "█" * cpu_filled + "░" * (W - cpu_filled)
-        mem_bar = "█" * mem_filled + "░" * (W - mem_filled)
+        cpu_bar = "\u2588" * cpu_filled + "\u2591" * (W - cpu_filled)
+        mem_bar = "\u2588" * mem_filled + "\u2591" * (W - mem_filled)
         cc = _load_color(cpu_pct)
         mc = _load_color(mem_pct)
 
@@ -623,7 +612,7 @@ class MikroTikMonitor(App):
         used_mb = used / 1048576
 
         text = (
-            f"[bold green]● Connected[/]  [dim]({self._login_msg})[/]\n"
+            f"[bold green]\u25cf Connected[/]  [dim]({self._login_msg})[/]\n"
             f"\n"
             f"  [bold]Identity :[/]  {self._identity}\n"
             f"  [bold]Host     :[/]  {self.api_host}:{self.api_port}\n"
@@ -648,9 +637,9 @@ class MikroTikMonitor(App):
             port = s.get("port", "?")
             disabled = s.get("disabled", "false") == "true"
             status = (
-                Text("○ disabled", style="bright_red")
+                Text("\u25cb disabled", style="bright_red")
                 if disabled
-                else Text("● enabled", style="green")
+                else Text("\u25cf enabled", style="green")
             )
             tbl.add_row(name, str(port), status)
         tbl.border_subtitle = f"{len(self._services)} services"
@@ -669,7 +658,8 @@ class MikroTikMonitor(App):
                 w = 25
                 filled = min(int(w * avg / max_t), w)
                 c = _latency_color(avg)
-                bar = f"[{c}]{'█' * filled}{'░' * (w - filled)}[/]"
+                blk = "\u2588" * filled + "\u2591" * (w - filled)
+                bar = f"[{c}]{blk}[/]"
                 lines.append(
                     f"  [bold]{n:>2}[/]  {host:<20} {bar}  {avg:.1f} ms"
                 )
@@ -707,8 +697,6 @@ class MikroTikMonitor(App):
             )
         tbl.border_subtitle = f"{len(self._active)} online"
 
-    # ── debug / failure view ────────────────────────────────────────────────
-
     def _show_debug(self):
         self.query_one("#dashboard").display = False
         self.query_one("#debug-view").display = True
@@ -718,17 +706,16 @@ class MikroTikMonitor(App):
         self._do_port_scan()
 
     def _render_debug_content(self):
-        S = "━"
+        S = "\u2501"
         L = [
-            "[bold red]✗ Connection Failed[/]\n",
+            "[bold red]\u2717 Connection Failed[/]\n",
             f"  [bold]Host :[/]  {self.api_host}",
             f"  [bold]Port :[/]  {self.api_port}",
             f"  [bold]User :[/]  {self.api_user}\n",
         ]
         for e in self._errors:
-            L.append(f"  [yellow]► {e}[/]")
+            L.append(f"  [yellow]\u25ba {e}[/]")
 
-        # port scan results
         if self._port_scan:
             L.append(f"\n[bold cyan]{S * 3} Port Scan {S * 38}[/]")
             for port in sorted(self._port_scan):
@@ -736,12 +723,11 @@ class MikroTikMonitor(App):
                 if port == self.api_port and port not in _PORT_NAMES:
                     name = "api (configured)"
                 ok = self._port_scan[port]
-                dot = "[green]●  open[/]" if ok else "[red]○  closed[/]"
+                dot = "[green]\u25cf  open[/]" if ok else "[red]\u25cb  closed[/]"
                 L.append(f"    {name:<16} {port:>5}   {dot}")
         else:
-            L.append("\n  [dim]Scanning ports…[/]")
+            L.append("\n  [dim]Scanning ports\u2026[/]")
 
-        # traceroute results
         if self._traceroute:
             L.append(f"\n[bold cyan]{S * 3} Traceroute {S * 37}[/]")
             for h in self._traceroute:
@@ -749,22 +735,21 @@ class MikroTikMonitor(App):
                 avg = f"{sum(times) / len(times):.1f} ms" if times else "* * *"
                 L.append(f"    {n:>2}  {host:<20}  {avg}")
         else:
-            L.append("  [dim]Running traceroute…[/]")
+            L.append("  [dim]Running traceroute\u2026[/]")
 
-        # suggestions
         L.append(f"\n[bold yellow]{S * 3} Suggestions {S * 36}[/]")
         if self._port_scan:
             api_open = self._port_scan.get(self.api_port, False)
             if not api_open:
                 L.append(
-                    f"    [red]✗[/] Port {self.api_port} is "
-                    f"[bold]closed[/] — check firewall / MikroTik IP > Services"
+                    f"    [red]\u2717[/] Port {self.api_port} is "
+                    f"[bold]closed[/] \u2014 check firewall / MikroTik IP > Services"
                 )
                 alt = [p for p in (8728, 8729) if self._port_scan.get(p)]
                 if alt:
-                    L.append(f"    [green]→[/] Try port [bold]{alt[0]}[/] instead")
+                    L.append(f"    [green]\u2192[/] Try port [bold]{alt[0]}[/] instead")
             else:
-                L.append(f"    [green]✓[/] Port {self.api_port} is [bold]open[/]")
+                L.append(f"    [green]\u2713[/] Port {self.api_port} is [bold]open[/]")
                 L.append("    [yellow]?[/] Verify username and password")
                 L.append(
                     "    [yellow]?[/] Check API service "
@@ -777,17 +762,15 @@ class MikroTikMonitor(App):
         )
         self.query_one("#debug-panel", Panel).update("\n".join(L))
 
-    # ── actions ─────────────────────────────────────────────────────────────
-
     def action_refresh(self):
         if self._connected:
-            self.notify("Refreshing…")
+            self.notify("Refreshing\u2026")
             self._do_refresh()
         else:
             self._errors.clear()
             self._port_scan.clear()
             self._traceroute.clear()
-            self.notify("Retrying connection…")
+            self.notify("Retrying connection\u2026")
             self._do_connect()
             self._do_traceroute()
 
@@ -818,22 +801,22 @@ class MikroTikMonitor(App):
                 pass
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
-
-
 def main():
-    if len(_sys.argv) != 5:
-        print(f"Usage: {_sys.argv[0]} <ip> <port> <username> <password>")
-        _sys.exit(1)
+    if len(sys.argv) != 5:
+        print(f"Usage: {sys.argv[0]} <ip> <port> <username> <password>")
+        sys.exit(1)
 
     app = MikroTikMonitor(
-        host=_sys.argv[1],
-        port=int(_sys.argv[2]),
-        user=_sys.argv[3],
-        password=_sys.argv[4],
+        host=sys.argv[1],
+        port=int(sys.argv[2]),
+        user=sys.argv[3],
+        password=sys.argv[4],
     )
     app.run()
 
 
 if __name__ == "__main__":
     main()
+PYTHON_SCRIPT
+
+"$PYTHON" "$_TMPPY" "$@"
